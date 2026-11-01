@@ -4,6 +4,10 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
 #include <XPT2046_Touchscreen.h>
 #include <lvgl.h>
 #include <time.h>
@@ -31,6 +35,10 @@ constexpr int TOUCH_MISO = 39;
 constexpr int TOUCH_MOSI = 32;
 constexpr int BACKLIGHT_PIN = 21;
 constexpr int SPEAKER_PIN = 26;
+// ESP32-2432S028R onboard RGB LED, common anode (LOW = on).
+constexpr int RGB_RED_PIN = 4;
+constexpr int RGB_GREEN_PIN = 16;
+constexpr int RGB_BLUE_PIN = 17;
 constexpr int BACKLIGHT_CHANNEL = 0;
 constexpr int SPEAKER_CHANNEL = 1;
 constexpr int SD_CS = 5;
@@ -52,7 +60,8 @@ SPIClass touchBus(VSPI);
 XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
 Preferences preferences;
 lv_disp_draw_buf_t drawBuffer;
-lv_color_t pixels[SCREEN_WIDTH * 20];
+// Keep the draw buffer on the heap to leave room in static DRAM.
+lv_color_t *pixels = nullptr;
 lv_obj_t *page = nullptr;
 lv_obj_t *headerTitle = nullptr;
 lv_obj_t *headerStatus = nullptr;
@@ -70,6 +79,12 @@ lv_obj_t *modeSdBtn = nullptr;
 lv_obj_t *radioListObj = nullptr;
 lv_obj_t *speakerBtn = nullptr;
 uint32_t lastRadioListVersion = 0;
+bool rateGraphMode = false;
+uint8_t rateGraphCurrency = 0, rateGraphMonths = 6;
+uint32_t rateGraphVersion = UINT32_MAX;
+RateHistory rateHistory;
+lv_obj_t *rateLine = nullptr;
+static lv_point_t ratePoints[RateHistory::kPoints];
 // Fullscreen playlist overlay (covers the whole display).
 lv_obj_t *plOverlay = nullptr;
 lv_obj_t *plListObj = nullptr;
@@ -91,6 +106,7 @@ struct Calibration {
   int y1 = 3800;
 } calibration;
 
+void applyBrightness();
 enum Screen { HOME, WEATHER, ALARM, RADIO, RATES, SETTINGS, TV };
 Screen activeScreen = HOME;
 const char *screenNames[7] = {"Главная", "Погода", "Сигнал", "Радио", "Курсы", "Настройки", "ТВ"};
@@ -120,6 +136,11 @@ AppData appData;
 static constexpr int kSdMax = 12;
 char sdNames[kSdMax][48]{};
 char sdInfo[kSdMax][24]{};
+bool sdDirs[kSdMax]{};
+String sdPath = "/";
+uint32_t sdOffset = 0;
+bool sdHasNext = false;
+WebServer sdWeb(80);
 uint8_t sdFileCount = 0;
 char sdStatus[64] = "SD карта не проверена";
 
@@ -131,10 +152,11 @@ enum Action : intptr_t {
   RADIO_MODE_WEB = 65, RADIO_MODE_SD = 66, RADIO_LIST_REFRESH = 67,
   PLAYLIST_OPEN = 68, PLAYLIST_CLOSE = 69,
   TV_POWER = 150, TV_MUTE, TV_VUP, TV_VDOWN, TV_CHUP, TV_CHDOWN,
-  TV_UP, TV_DOWN, TV_LEFT, TV_RIGHT, TV_OK, TV_BACK, TV_HOME, TV_EXIT, TV_INPUT, TV_PAIR,
+  TV_UP, TV_DOWN, TV_LEFT, TV_RIGHT, TV_OK, TV_BACK, TV_HOME, TV_EXIT, TV_INPUT, TV_PAIR, TV_STS, TV_TNT, TV_NTV, TV_ORT,
   REFRESH_DATA = 80, ALERT_DISMISS,
   STATION_BASE = 100,
-  SET_BRIGHT_DOWN = 140, SET_BRIGHT_UP, SET_SPEAKER, SET_RESET_CAL, SD_REFRESH,
+  SET_BRIGHT_DOWN = 140, SET_BRIGHT_UP, SET_SPEAKER, SET_RESET_CAL, SD_REFRESH, SD_PARENT, SD_PREV, SD_NEXT,
+  SD_ITEM_BASE = 300, RATE_ITEM_BASE = 350, RATE_GRAPH_BACK = 360, RATE_6M, RATE_1Y,
 };
 
 lv_color_t color(uint32_t value) { return lv_color_hex(value); }
@@ -172,6 +194,8 @@ bool calibrationPoint(int targetX, int targetY, int &rawX, int &rawY) {
   display.drawCircle(targetX, targetY, 10, TFT_YELLOW);
   display.drawLine(targetX - 14, targetY, targetX + 14, targetY, TFT_YELLOW);
   display.drawLine(targetX, targetY - 14, targetX, targetY + 14, TFT_YELLOW);
+  // The calibration prompt is already drawn; make it visible before waiting for touch.
+  applyBrightness();
   const uint32_t started = millis();
   while (millis() - started < 30000UL) {
     if (touch.touched()) {
@@ -222,6 +246,28 @@ lv_obj_t *box(lv_obj_t *parent, int x, int y, int width, int height, uint32_t ba
   lv_obj_set_style_pad_all(obj, 0, 0);
   return obj;
 }
+
+// Preserve original data; replace missing glyphs only in text sent to LVGL.
+void setSafeLabelText(lv_obj_t *obj, const char *text) {
+  if (!text) { lv_label_set_text(obj, ""); return; }
+  const lv_font_t *font=lv_obj_get_style_text_font(obj, LV_PART_MAIN);
+  String safe; safe.reserve(strlen(text)+1);
+  const size_t len=strlen(text);
+  for (size_t i=0; i<len;) {
+    const unsigned char c=(unsigned char)text[i]; uint32_t cp=0; size_t bytes=1;
+    if(c<0x80) cp=c;
+    else if(c>=0xC2 && c<=0xDF && i+1<len && ((unsigned char)text[i+1]&0xC0)==0x80) { cp=((c&31)<<6)|((unsigned char)text[i+1]&63); bytes=2; }
+    else if(c>=0xE0 && c<=0xEF && i+2<len && ((unsigned char)text[i+1]&0xC0)==0x80 && ((unsigned char)text[i+2]&0xC0)==0x80) { cp=((c&15)<<12)|(((unsigned char)text[i+1]&63)<<6)|((unsigned char)text[i+2]&63); bytes=3; }
+    else if(c>=0xF0 && c<=0xF4 && i+3<len && ((unsigned char)text[i+1]&0xC0)==0x80 && ((unsigned char)text[i+2]&0xC0)==0x80 && ((unsigned char)text[i+3]&0xC0)==0x80) { cp=((c&7)<<18)|(((unsigned char)text[i+1]&63)<<12)|(((unsigned char)text[i+2]&63)<<6)|((unsigned char)text[i+3]&63); bytes=4; }
+    lv_font_glyph_dsc_t glyph{};
+    bool present = (cp=='\n' || cp=='\r') || (cp>=32 && font && lv_font_get_glyph_dsc(font,&glyph,cp,0) && !glyph.is_placeholder);
+    if(present) safe.concat(text+i,bytes); else safe += '?';
+    i+=bytes;
+  }
+  const char *current = lv_label_get_text(obj);
+  if (!current || strcmp(current, safe.c_str()) != 0) lv_label_set_text(obj,safe.c_str());
+}
+#define lv_label_set_text setSafeLabelText
 
 lv_obj_t *label(lv_obj_t *parent, int x, int y, int width, const char *text,
                 const lv_font_t *font = &cyd_ru14, uint32_t textColor = TEXT) {
@@ -280,8 +326,45 @@ void saveDeviceSettings() {
   preferences.putBool("spk", spkOn);
 }
 
+// Dedicated task so a blocking SD transfer does not freeze the blinking LED.
+QueueHandle_t alarmLedQueue = nullptr;
+void setAlarmLed(uint8_t mask) {
+  digitalWrite(RGB_RED_PIN,   (mask & 1) ? LOW : HIGH);
+  digitalWrite(RGB_GREEN_PIN, (mask & 2) ? LOW : HIGH);
+  digitalWrite(RGB_BLUE_PIN,  (mask & 4) ? LOW : HIGH);
+}
+void alarmLedTask(void *) {
+  static const uint8_t colors[] = {1, 2, 4, 3, 6, 5, 7};
+  bool active=false, lit=false;
+  unsigned index=0;
+  for (;;) {
+    bool requested=false;
+    if(xQueueReceive(alarmLedQueue, &requested, active ? pdMS_TO_TICKS(lit ? 300 : 150) : portMAX_DELAY) == pdTRUE) {
+      active=requested; lit=active; index=0;
+      setAlarmLed(active ? colors[index] : 0);
+    } else if(active) {
+      lit=!lit;
+      if(lit) index=(index+1) % (sizeof(colors)/sizeof(colors[0]));
+      setAlarmLed(lit ? colors[index] : 0);
+    }
+  }
+}
+void setupAlarmLed() {
+  const int pins[] = {RGB_RED_PIN,RGB_GREEN_PIN,RGB_BLUE_PIN};
+  for(int pin : pins) { digitalWrite(pin,HIGH); pinMode(pin,OUTPUT); }
+  setAlarmLed(0);
+  alarmLedQueue=xQueueCreate(1,sizeof(bool));
+  if(alarmLedQueue && xTaskCreatePinnedToCore(alarmLedTask,"alarm-led",2048,nullptr,1,nullptr,0)!=pdPASS) {
+    vQueueDelete(alarmLedQueue); alarmLedQueue=nullptr;
+  }
+}
+void setAlarmLedActive(bool active) {
+  if(alarmLedQueue) xQueueOverwrite(alarmLedQueue,&active);
+}
+
 void dismissAlert() {
   ringing = false;
+  setAlarmLedActive(false);
   ledcWriteTone(SPEAKER_CHANNEL, 0);
   if (alertBox) {
     lv_obj_del(alertBox);
@@ -293,10 +376,11 @@ void startAlert(bool alarm) {
   if (ringing) return;
   ringing = true;
   ringStarted = millis();
+  setAlarmLedActive(alarm);
   if (alarm) sendRadioCommand("start=1");
   alertBox = box(lv_scr_act(), 15, 100, 210, 110, 0x603b23);
   label(alertBox, 14, 12, 182, alarm ? "БУДИЛЬНИК" : "ТАЙМЕР ЗАВЕРШЁН", &cyd_ru18, 0xffffff);
-  label(alertBox, 14, 42, 182, "Тап — остановить сигнал", &cyd_ru14, 0xffffff);
+  label(alertBox, 14, 42, 182, "Тап - остановить сигнал", &cyd_ru14, 0xffffff);
   button(alertBox, 53, 70, 104, 28, "Остановить", ALERT_DISMISS, 0x94602a);
   lv_obj_move_foreground(alertBox);
 }
@@ -550,7 +634,7 @@ void fillPlaylist() {
   const uint8_t count = sdMode ? appData.radio.sdCount : appData.radio.stationCount;
   if (plTitleLbl) {
     char title[48];
-    snprintf(title, sizeof(title), "Плейлист · %s %u", sdMode ? "SD" : "Радио", static_cast<unsigned>(count));
+    snprintf(title, sizeof(title), "Плейлист - %s %u", sdMode ? "SD" : "Радио", static_cast<unsigned>(count));
     lv_label_set_text(plTitleLbl, title);
   }
   refreshModeButtons();
@@ -603,26 +687,30 @@ void buildTv() {
   lv_obj_add_flag(page, LV_OBJ_FLAG_SCROLLABLE);
   label(page, 8, 2, 200, "Телевизор LG", &cyd_ru14, ACCENT);
   labels[0] = label(page, 8, 22, 224, "Нет настроек ТВ", &cyd_ru12, MUTED);
-  button(page, 6, 42, 150, 30, "Питание", TV_POWER, 0x8b6c18);
-  button(page, 160, 42, 74, 30, "Без звука", TV_MUTE);
-  button(page, 6, 76, 60, 28, "Громк -", TV_VDOWN);
-  labels[1] = label(page, 70, 78, 100, "--", &cyd_ru18);
+  button(page, 6, 42, 54, 29, "СТС", TV_STS);
+  button(page, 64, 42, 54, 29, "ТНТ", TV_TNT);
+  button(page, 122, 42, 54, 29, "НТВ", TV_NTV);
+  button(page, 180, 42, 54, 29, "ОРТ", TV_ORT);
+  button(page, 6, 76, 150, 30, "Питание", TV_POWER, 0x8b6c18);
+  button(page, 160, 76, 74, 30, "Без звука", TV_MUTE);
+  button(page, 6, 110, 60, 28, "Громк -", TV_VDOWN);
+  labels[1] = label(page, 70, 112, 100, "--", &cyd_ru18);
   lv_obj_set_style_text_align(labels[1], LV_TEXT_ALIGN_CENTER, 0);
-  button(page, 174, 76, 60, 28, "Громк +", TV_VUP);
-  button(page, 6, 108, 60, 28, "Кан -", TV_CHDOWN);
-  labels[2] = label(page, 70, 110, 100, "--", &cyd_ru14);
+  button(page, 174, 110, 60, 28, "Громк +", TV_VUP);
+  button(page, 6, 142, 60, 28, "Кан -", TV_CHDOWN);
+  labels[2] = label(page, 70, 144, 100, "--", &cyd_ru14);
   lv_obj_set_style_text_align(labels[2], LV_TEXT_ALIGN_CENTER, 0);
-  button(page, 174, 108, 60, 28, "Кан +", TV_CHUP);
-  button(page, 91, 140, 58, 28, "Вверх", TV_UP);
-  button(page, 29, 172, 58, 28, "Влево", TV_LEFT);
-  button(page, 91, 172, 58, 28, "OK", TV_OK);
-  button(page, 153, 172, 58, 28, "Вправо", TV_RIGHT);
-  button(page, 91, 204, 58, 28, "Вниз", TV_DOWN);
-  button(page, 6, 236, 72, 28, "Назад", TV_BACK);
-  button(page, 82, 236, 72, 28, "Домой", TV_HOME);
-  button(page, 158, 236, 72, 28, "Выход", TV_EXIT);
-  button(page, 6, 268, 112, 28, "Источник", TV_INPUT);
-  button(page, 122, 268, 112, 28, "Сопряжение", TV_PAIR);
+  button(page, 174, 142, 60, 28, "Кан +", TV_CHUP);
+  button(page, 91, 174, 58, 28, "Вверх", TV_UP);
+  button(page, 29, 206, 58, 28, "Влево", TV_LEFT);
+  button(page, 91, 206, 58, 28, "OK", TV_OK);
+  button(page, 153, 206, 58, 28, "Вправо", TV_RIGHT);
+  button(page, 91, 238, 58, 28, "Вниз", TV_DOWN);
+  button(page, 6, 270, 72, 28, "Назад", TV_BACK);
+  button(page, 82, 270, 72, 28, "Домой", TV_HOME);
+  button(page, 158, 270, 72, 28, "Выход", TV_EXIT);
+  button(page, 6, 302, 112, 28, "Источник", TV_INPUT);
+  button(page, 122, 302, 112, 28, "Сопряжение", TV_PAIR);
   refreshTv();
 }
 
@@ -642,6 +730,18 @@ void refreshTv() {
 
 void onAction(lv_event_t *event) {
   const intptr_t action = reinterpret_cast<intptr_t>(lv_event_get_user_data(event));
+  if (action >= RATE_ITEM_BASE && action < RATE_ITEM_BASE + 4) {
+    rateGraphCurrency = action - RATE_ITEM_BASE; rateGraphMonths = 6; rateGraphMode = true;
+    requestRateHistory(rateGraphCurrency,rateGraphMonths); showScreen(RATES); return;
+  }
+  if (action >= SD_ITEM_BASE && action < SD_ITEM_BASE + kSdMax) {
+    unsigned i = action - SD_ITEM_BASE;
+    if (i < sdFileCount && sdDirs[i]) {
+      String next = sdPath == "/" ? "/" + String(sdNames[i]) : sdPath + "/" + sdNames[i];
+      if (next.length() < 240) { sdPath = next; sdOffset = 0; showScreen(SETTINGS); }
+    }
+    return;
+  }
   if (action >= DAY_BASE && action < DAY_BASE + 7) {
     alarmDays ^= static_cast<uint8_t>(1U << (action - DAY_BASE));
     saveAlarm();
@@ -729,7 +829,17 @@ void onAction(lv_event_t *event) {
       preferences.remove("pcaly1");
       ESP.restart();
       break;
+    case RATE_GRAPH_BACK: rateGraphMode=false; showScreen(RATES); return;
+    case RATE_6M: case RATE_1Y:
+      rateGraphMonths = action == RATE_6M ? 6 : 12;
+      requestRateHistory(rateGraphCurrency,rateGraphMonths); showScreen(RATES); return;
     case SD_REFRESH: showScreen(SETTINGS); return;
+    case SD_PARENT: {
+      if (sdPath != "/") { int pos = sdPath.lastIndexOf('/'); sdPath = pos <= 0 ? "/" : sdPath.substring(0, pos); }
+      sdOffset = 0; showScreen(SETTINGS); return;
+    }
+    case SD_PREV: sdOffset = sdOffset >= kSdMax ? sdOffset - kSdMax : 0; showScreen(SETTINGS); return;
+    case SD_NEXT: if (sdHasNext) sdOffset += kSdMax; showScreen(SETTINGS); return;
     case TV_POWER: sendTvKey(LG_POWER); requestTvStatus(); break;
     case TV_MUTE: sendTvKey(LG_MUTE_TOGGLE); requestTvStatus(); break;
     case TV_VUP: sendTvKey(LG_VOLUME_UP); requestTvStatus(); break;
@@ -746,6 +856,10 @@ void onAction(lv_event_t *event) {
     case TV_EXIT: sendTvKey(LG_EXIT); break;
     case TV_INPUT: sendTvKey(LG_EXTERNAL_INPUT); break;
     case TV_PAIR: tvPairShowKey(); break;
+    case TV_STS: sendTvChannel(13); break;
+    case TV_TNT: sendTvChannel(19); break;
+    case TV_NTV: sendTvChannel(4); break;
+    case TV_ORT: sendTvChannel(9); break;
     case REFRESH_DATA: requestDataRefresh(); requestRadioLists(); break;
     case ALERT_DISMISS: dismissAlert(); return;
     default: break;
@@ -758,22 +872,28 @@ void onNavigate(lv_event_t *event) {
 }
 
 void buildHome() {
+  // The weather card and calendar remain readable; scroll down for the last weeks.
+  lv_obj_add_flag(page, LV_OBJ_FLAG_SCROLLABLE);
   labels[0] = label(page, 8, 0, 224, "--:--", &lv_font_montserrat_48, ACCENT);
   lv_obj_set_style_text_align(labels[0], LV_TEXT_ALIGN_CENTER, 0);
-  labels[5] = label(page, 196, 44, 36, "", &cyd_ru12, MUTED);
-  labels[1] = label(page, 8, 54, 224, "Ожидание NTP", &cyd_ru18, MUTED);
+  labels[5] = label(page, 202, 19, 30, "--", &cyd_ru18, MUTED);
+  labels[1] = label(page, 8, 55, 224, "Ожидание NTP", &cyd_ru14, MUTED);
   lv_obj_set_style_text_align(labels[1], LV_TEXT_ALIGN_CENTER, 0);
-  box(page, 6, 78, 228, 46);
-  homeIconObj = makeIcon(page, 14, 83, 30, iconBuf[0], WI_CLOUD);
-  labels[2] = label(page, 50, 84, 178, CITY_A_NAME, &cyd_ru14);
-  labels[3] = label(page, 50, 104, 178, "--°C", &cyd_ru14, MINT);
-  calTitle = label(page, 8, 128, 224, "", &cyd_ru14, ACCENT);
+  box(page, 6, 76, 228, 91);
+  homeIconObj = makeIcon(page, 14, 82, 30, iconBuf[0], WI_CLOUD);
+  labels[2] = label(page, 50, 78, 178, CITY_A_NAME, &cyd_ru14);
+  labels[3] = label(page, 50, 96, 178, "--°C", &cyd_ru14, MINT);
+  labels[4] = label(page, 50, 113, 178, "Ожидание погоды", &cyd_ru12, MUTED);
+  lv_label_set_long_mode(labels[4], LV_LABEL_LONG_SCROLL_CIRCULAR);
+  labels[6] = label(page, 14, 131, 215, "Ощ. --  Ветер --", &cyd_ru12);
+  labels[7] = label(page, 14, 148, 215, "Влажн. --  Давл. --", &cyd_ru12);
+  calTitle = label(page, 8, 171, 224, "", &cyd_ru14, ACCENT);
   for (int i = 0; i < 7; ++i) {
-    lv_obj_t *head = label(page, 8 + i * 32, 146, 30, dayNames[i], &cyd_ru12, i >= 5 ? WEEKEND : MUTED);
+    lv_obj_t *head = label(page, 8 + i * 32, 189, 30, dayNames[i], &cyd_ru12, i >= 5 ? WEEKEND : MUTED);
     lv_obj_set_style_text_align(head, LV_TEXT_ALIGN_CENTER, 0);
   }
   for (int i = 0; i < 42; ++i) {
-    calCells[i] = button(page, 8 + (i % 7) * 32, 160 + (i / 7) * 14, 30, 12, "", 0, 0x101a2a);
+    calCells[i] = button(page, 8 + (i % 7) * 32, 203 + (i / 7) * 14, 30, 12, "", 0, 0x101a2a);
   }
 }
 
@@ -846,12 +966,49 @@ void buildRadio() {
 }
 
 void buildRates() {
-  label(page, 8, 4, 140, "Курсы MOEX", &cyd_ru18, ACCENT);
-  button(page, 150, 2, 84, 26, "Обновить", REFRESH_DATA);
-  labels[0] = label(page, 8, 34, 224, "Ожидание данных", &cyd_ru14, MUTED);
-  for (int i = 0; i < 4; ++i) {
-    labels[i + 1] = label(page, 12, 60 + i * 32, 220, "--", &cyd_ru18);
+  const char *names[4] = {"USD/RUB", "EUR/RUB", "CNY/RUB", "GBP/RUB"};
+  if (!rateGraphMode) {
+    label(page, 8, 4, 140, "Курсы MOEX", &cyd_ru18, ACCENT);
+    button(page, 150, 2, 84, 26, "Обновить", REFRESH_DATA);
+    labels[0] = label(page, 8, 34, 224, "Ожидание данных", &cyd_ru14, MUTED);
+    for (int i=0;i<4;++i) {
+      lv_obj_t *row=button(page, 8, 60+i*38, 224, 34, "", RATE_ITEM_BASE+i, 0x1d2c46);
+      labels[i+1]=label(row, 10, 7, 204, names[i], &cyd_ru18);
+    }
+    return;
   }
+  label(page, 8, 2, 120, names[rateGraphCurrency], &cyd_ru18, ACCENT);
+  button(page, 158, 2, 74, 25, "Назад", RATE_GRAPH_BACK);
+  button(page, 8, 32, 105, 25, "6 месяцев", RATE_6M, rateGraphMonths==6?0x745b16:PANEL);
+  button(page, 120, 32, 105, 25, "1 год", RATE_1Y, rateGraphMonths==12?0x745b16:PANEL);
+  labels[0]=label(page, 8, 61, 224, "Загрузка ЦБ...", &cyd_ru12, MUTED);
+  labels[1]=label(page, 8, 78, 224, "", &cyd_ru12, MINT);
+  labels[2]=label(page, 8, 191, 224, "", &cyd_ru12, MINT);
+  labels[3]=label(page, 8, 209, 224, "", &cyd_ru12, MUTED);
+  rateLine=lv_line_create(page);
+  lv_obj_set_pos(rateLine, 18, 96); lv_obj_set_size(rateLine, 204, 88);
+  lv_obj_set_style_line_width(rateLine, 2, 0); lv_obj_set_style_line_color(rateLine, color(MINT), 0);
+  rateGraphVersion=UINT32_MAX;
+}
+
+void refreshRateGraph() {
+  copyRateHistory(rateHistory);
+  if (rateHistory.currency!=rateGraphCurrency || rateHistory.months!=rateGraphMonths || rateHistory.version==rateGraphVersion) return;
+  rateGraphVersion=rateHistory.version;
+  lv_label_set_text(labels[0],rateHistory.message);
+  if(!rateHistory.valid) { lv_line_set_points(rateLine,ratePoints,0); lv_label_set_text(labels[1],""); lv_label_set_text(labels[2],""); lv_label_set_text(labels[3],""); return; }
+  float low=1e9f, high=0;
+  for(float x:rateHistory.values) if(x>0) { if(x<low)low=x; if(x>high)high=x; }
+  int n=0; float span=high-low; if(span<0.00001f) span=1;
+  for(int i=0;i<RateHistory::kPoints;++i) if(rateHistory.values[i]>0) {
+    ratePoints[n].x=i*203/(RateHistory::kPoints-1);
+    ratePoints[n].y=87-(int)((rateHistory.values[i]-low)*87/span); ++n;
+  }
+  lv_line_set_points(rateLine,ratePoints,n);
+  char text[40];
+  snprintf(text,sizeof(text),"Макс: %.4f",high); lv_label_set_text(labels[1],text);
+  snprintf(text,sizeof(text),"Мин: %.4f",low); lv_label_set_text(labels[2],text);
+  lv_label_set_text_fmt(labels[3],"%s - %s",rateHistory.from,rateHistory.to);
 }
 
 // Touch and SD share the VSPI host with different pins, so the bus is
@@ -882,78 +1039,126 @@ bool sdNameLess(const char *a, const char *b) {
   return *a == '\0' && *b != '\0';
 }
 
-void readSdFiles() {
-  sdFileCount = 0;
+// All SD operations, including HTTP, run on the UI task. Stop VSPI before
+// reassigning its pins; SPIClass::begin does nothing if it is already started.
+bool sdMount() {
   sdParkBus();
-  delay(10);
+  touchBus.end();
   touchBus.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  delay(10);
-  static const uint32_t sdSpeeds[] = {4000000, 2000000, 1000000};
-  bool mounted = false;
-  for (uint8_t attempt = 0; attempt < 3 && !mounted; ++attempt) {
-    SD.end();
-    sdParkBus();
-    if (SD.begin(SD_CS, touchBus, sdSpeeds[attempt])) {
-      mounted = true;
-    } else {
-      delay(50);
-    }
+  const uint32_t speeds[] = {4000000, 2000000, 1000000};
+  for (uint32_t speed : speeds) {
+    SD.end(); sdParkBus();
+    if (SD.begin(SD_CS, touchBus, speed)) return true;
+    delay(30);
   }
-  if (!mounted) {
-    snprintf(sdStatus, sizeof(sdStatus), "SD: нет карты (нужен FAT32)");
-    SD.end();
-    digitalWrite(SD_CS, HIGH);
-    touchBus.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
-    return;
-  }
-  File root = SD.open("/");
-  if (!root) {
-    snprintf(sdStatus, sizeof(sdStatus), "Ошибка чтения SD");
-    SD.end();
-    digitalWrite(SD_CS, HIGH);
-    touchBus.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
-    return;
-  }
-  root.rewindDirectory();
-  uint8_t total = 0;
-  File entry = root.openNextFile();
-  while (entry && sdFileCount < kSdMax) {
-    ++total;
-    const char *name = entry.name();
-    if (name[0] == '/') ++name;
-    if (name[0] != '.' && name[0] != '\0') {
-      snprintf(sdNames[sdFileCount], sizeof(sdNames[0]), "%.*s", 40, name);
-      if (entry.isDirectory()) {
-        snprintf(sdInfo[sdFileCount], sizeof(sdInfo[0]), "<папка>");
-      } else {
-        const uint32_t kb = static_cast<uint32_t>((entry.size() + 1023) / 1024);
-        snprintf(sdInfo[sdFileCount], sizeof(sdInfo[0]), "%lu КБ", static_cast<unsigned long>(kb));
-      }
-      ++sdFileCount;
-    }
-    entry.close();
-    if (total < 250) entry = root.openNextFile();
-    else break;
-  }
-  root.close();
-  for (uint8_t i = 0; i < sdFileCount; ++i) {
-    for (uint8_t j = i + 1; j < sdFileCount; ++j) {
-      if (sdNameLess(sdNames[j], sdNames[i])) {
-        char tmpName[48];
-        char tmpInfo[24];
-        memcpy(tmpName, sdNames[i], sizeof(tmpName));
-        memcpy(tmpInfo, sdInfo[i], sizeof(tmpInfo));
-        memcpy(sdNames[i], sdNames[j], sizeof(tmpName));
-        memcpy(sdInfo[i], sdInfo[j], sizeof(tmpInfo));
-        memcpy(sdNames[j], tmpName, sizeof(tmpName));
-        memcpy(sdInfo[j], tmpInfo, sizeof(tmpInfo));
-      }
-    }
-  }
-  snprintf(sdStatus, sizeof(sdStatus), "SD OK: показано %u", static_cast<unsigned>(sdFileCount));
-  SD.end();
+  SD.end(); touchBus.end(); sdParkBus();
+  touchBus.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+  return false;
+}
+void sdUnmount() {
+  SD.end(); touchBus.end(); sdParkBus();
   touchBus.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
 }
+
+void readSdFiles() {
+  sdFileCount = 0; sdHasNext = false;
+  if (!sdMount()) { strlcpy(sdStatus, "SD: ошибка карты/FAT32", sizeof(sdStatus)); return; }
+  File root = SD.open(sdPath.c_str());
+  if (!root || !root.isDirectory()) {
+    strlcpy(sdStatus, "Ошибка папки SD", sizeof(sdStatus));
+    root.close(); sdUnmount(); return;
+  }
+  uint32_t seen = 0;
+  File entry = root.openNextFile();
+  while (entry) {
+    const char *name = entry.name();
+    const char *slash = strrchr(name, '/'); if (slash) name = slash + 1;
+    if (name[0] && name[0] != '.') {
+      if (seen++ >= sdOffset) {
+        if (sdFileCount == kSdMax) { sdHasNext = true; entry.close(); break; }
+        // Do not navigate with a truncated filename.
+        strlcpy(sdNames[sdFileCount], name, sizeof(sdNames[0]));
+        sdDirs[sdFileCount] = entry.isDirectory() && strlen(name) < sizeof(sdNames[0]);
+        if (entry.isDirectory()) strlcpy(sdInfo[sdFileCount], "<папка>", sizeof(sdInfo[0]));
+        else snprintf(sdInfo[sdFileCount], sizeof(sdInfo[0]), "%lu КБ", (unsigned long)((entry.size()+1023)/1024));
+        ++sdFileCount;
+      }
+    }
+    entry.close(); entry = root.openNextFile();
+  }
+  root.close(); sdUnmount();
+  snprintf(sdStatus, sizeof(sdStatus), "SD: %lu-%lu", (unsigned long)(sdOffset+1), (unsigned long)(sdOffset+sdFileCount));
+}
+
+// Read-only HTTP browser. The same task owns the bus throughout each request.
+bool safeSdPath(const String &path) {
+  if (!path.startsWith("/") || path.length() > 240 || path.indexOf('\\') >= 0 || path.indexOf("//") >= 0) return false;
+  int start = 1;
+  while (start <= (int)path.length()) {
+    int end = path.indexOf('/', start); if (end < 0) end = path.length();
+    String part = path.substring(start, end);
+    if (part == "." || part == "..") return false;
+    for (unsigned i=0; i<part.length(); ++i) if ((unsigned char)part[i] < 32) return false;
+    start = end + 1;
+  }
+  return true;
+}
+String htmlEscape(const String &in) {
+  String out;
+  for (unsigned i=0; i<in.length(); ++i) {
+    char c=in[i]; if(c=='&') out += "&amp;"; else if(c=='<') out += "&lt;";
+    else if(c=='>') out += "&gt;"; else if(c=='\"') out += "&quot;"; else if(c=='\'') out += "&#39;"; else out += c;
+  }
+  return out;
+}
+String urlEncode(const String &in) {
+  const char *hex="0123456789ABCDEF"; String out;
+  for (unsigned i=0;i<in.length();++i) { unsigned char c=in[i];
+    if ((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.'||c=='~') out += (char)c;
+    else { out += '%'; out += hex[c>>4]; out += hex[c&15]; }
+  } return out;
+}
+#include "sd_admin_impl.h"
+#include "web_ota_impl.h"
+
+void handleSdWeb() {
+  if (sdAdminConfigured() && !sdAuthorize()) return;
+  sdWeb.sendHeader("Cache-Control", "no-store");
+  sdWeb.sendHeader("Referrer-Policy", "no-referrer");
+  String path = sdWeb.hasArg("path") ? sdWeb.arg("path") : "/";
+  if (!safeSdPath(path)) { sdWeb.send(400,"text/plain; charset=utf-8","Invalid path"); return; }
+  if (!sdMount()) { sdWeb.send(503,"text/html; charset=utf-8","<meta charset=utf-8>SD карта недоступна. <a href='/update'>Обновить прошивку</a>"); return; }
+  File file = SD.open(path.c_str(), FILE_READ);
+  if (!file) { sdUnmount(); sdWeb.send(404,"text/plain","Not found"); return; }
+  sdWeb.sendHeader("X-Content-Type-Options", "nosniff");
+  if (!file.isDirectory()) {
+    String name=path.substring(path.lastIndexOf('/')+1);
+    sdWeb.sendHeader("Content-Disposition", "attachment; filename=\"download\"; filename*=UTF-8''"+urlEncode(name));
+    sdWeb.streamFile(file, "application/octet-stream"); file.close(); sdUnmount(); return;
+  }
+  sdWeb.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  sdWeb.send(200,"text/html; charset=utf-8", "<!doctype html><html lang=ru><meta charset=utf-8><meta name=viewport content='width=device-width'><title>SD карта</title><style>body{font:16px sans-serif;max-width:800px;margin:2em auto;padding:0 1em;background:#101827;color:#eee}a{color:#67d8c1}li{padding:.5em;overflow-wrap:anywhere}form.inline{display:inline}button{padding:.4em;margin-left:1em} .upload{margin:1em 0}</style><h1>SD карта</h1><p><a href='/update'>Обновить прошивку</a></p><p>"+htmlEscape(path)+"</p>"+(sdAdminConfigured()?"":"<p>Запись отключена: настройте SD_WEB_PASSWORD.</p>")+"<ul>");
+  if (path != "/") { int pos=path.lastIndexOf('/'); String parent=pos<=0?"/":path.substring(0,pos); sdWeb.sendContent("<li><a href='/?path="+urlEncode(parent)+"'>..</a></li>"); }
+  File entry=file.openNextFile();
+  while(entry) {
+    String name=entry.name(); int slash=name.lastIndexOf('/'); if(slash>=0) name=name.substring(slash+1);
+    if(name.length() && name[0]!='.') {
+      String child=path=="/"?"/"+name:path+"/"+name;
+      String line="<li><a href='/?path="+urlEncode(child)+"'>"+htmlEscape(name)+(entry.isDirectory()?"/":"")+"</a>";
+      if(!entry.isDirectory()) {
+        line += " ("+String((unsigned long)entry.size())+" байт)";
+        if(sdAdminConfigured()) line += " <form class='inline' method='post' action='/delete?path="+urlEncode(child)+"&amp;token="+sdCsrf+"' onsubmit=\"return confirm('Удалить файл?')\"><button type='submit'>Удалить</button></form>";
+      }
+      sdWeb.sendContent(line+"</li>");
+    }
+    entry.close(); entry=file.openNextFile(); yield();
+  }
+  file.close(); sdWeb.sendContent("</ul>");
+  if(sdAdminConfigured()) sdWeb.sendContent("<form class='upload' method='post' enctype='multipart/form-data' action='/upload?path="+urlEncode(path)+"&amp;token="+sdCsrf+"'><label>Загрузить файл: <input type='file' name='file' required></label><button type='submit'>Загрузить</button></form><p>Существующие файлы не перезаписываются.</p>");
+  sdWeb.sendContent("</html>"); sdWeb.sendContent(""); sdUnmount();
+}
+
+#include "dlna_impl.h"
 
 void buildSettings() {
   copyAppData(appData);
@@ -971,21 +1176,27 @@ void buildSettings() {
   button(page, 120, 114, 108, 28, "Сброс калибр.", SET_RESET_CAL);
   labels[3] = label(page, 8, 148, 140, "Файлы SD", &cyd_ru12, ACCENT);
   button(page, 162, 144, 66, 22, "Читать", SD_REFRESH);
-  int y = 172;
+  label(page, 8, 170, 224, sdPath.c_str(), &cyd_ru12, MUTED);
+  button(page, 8, 188, 64, 24, "Вверх", SD_PARENT);
+  button(page, 80, 188, 64, 24, "<", SD_PREV);
+  button(page, 152, 188, 64, 24, ">", SD_NEXT);
+  int y = 216;
   for (uint8_t i = 0; i < sdFileCount; ++i) {
-    lv_obj_t *row = box(page, 8, y, 224, 26, 0x1d2c46);
+    lv_obj_t *row = sdDirs[i] ? button(page, 8, y, 224, 26, "", static_cast<Action>(SD_ITEM_BASE + i), 0x1d2c46) : box(page, 8, y, 224, 26, 0x1d2c46);
     lv_obj_t *nameLbl = label(row, 8, 4, 140, sdNames[i], &cyd_ru12);
     lv_label_set_long_mode(nameLbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
     label(row, 152, 4, 64, sdInfo[i], &cyd_ru12, MINT);
     y += 30;
   }
   if (sdFileCount == 0) {
-    label(page, 8, 172, 224, sdStatus, &cyd_ru12, MUTED);
+    label(page, 8, 216, 224, sdStatus, &cyd_ru12, MUTED);
   }
 }
 
 void showScreen(Screen screen) {
+  if (screen != RATES) rateGraphMode=false;
   activeScreen = screen;
+  rateLine=nullptr;
   closePlaylist();
   for (auto &item : labels) item = nullptr;
   for (auto &item : daysButtons) item = nullptr;
@@ -1035,17 +1246,24 @@ void refreshScreen() {
       lv_label_set_text_fmt(labels[0], "%02d:%02d", localA.tm_hour, localA.tm_min);
       lv_label_set_text_fmt(labels[5], "%02d", localA.tm_sec);
       const unsigned mondayFirst = static_cast<unsigned>((localA.tm_wday + 6) % 7);
-      lv_label_set_text_fmt(labels[1], "%02d.%02d.%04d · %s", localA.tm_mday, localA.tm_mon + 1,
+      lv_label_set_text_fmt(labels[1], "%02d.%02d.%04d %s", localA.tm_mday, localA.tm_mon + 1,
                             localA.tm_year + 1900, dayFullNames[mondayFirst]);
       const int key = (localA.tm_year + 1900) * 1000 + localA.tm_yday;
       if (key != calShownKey) refillCalendar(localA);
     }
     if (city.valid) {
-      char temp[64];
-      snprintf(temp, sizeof(temp), "%.1f°C %s", city.temperature, city.description);
-      lv_label_set_text(labels[3], temp);
+      char temp[48], feels[16], wind[16], humidity[16], pressure[16];
+      snprintf(temp, sizeof(temp), "%.1f°C", city.temperature); lv_label_set_text(labels[3], temp);
+      lv_label_set_text(labels[4], city.description[0] ? city.description : "Нет описания");
+      if(isfinite(city.feelsLike)) snprintf(feels,sizeof(feels),"%.1f°C",city.feelsLike); else strlcpy(feels,"--",sizeof(feels));
+      if(isfinite(city.windSpeed)) snprintf(wind,sizeof(wind),"%.1f м/с",city.windSpeed); else strlcpy(wind,"--",sizeof(wind));
+      if(city.humidity>=0) snprintf(humidity,sizeof(humidity),"%d%%",city.humidity); else strlcpy(humidity,"--",sizeof(humidity));
+      if(city.pressure>=0) snprintf(pressure,sizeof(pressure),"%d гПа",city.pressure); else strlcpy(pressure,"--",sizeof(pressure));
+      snprintf(temp,sizeof(temp),"Ощ. %s  Ветер %s",feels,wind); lv_label_set_text(labels[6],temp);
+      snprintf(temp,sizeof(temp),"Влажн. %s  Давл. %s",humidity,pressure); lv_label_set_text(labels[7],temp);
     } else {
-      lv_label_set_text(labels[3], "--°C");
+      lv_label_set_text(labels[3], "--°C"); lv_label_set_text(labels[4], city.error);
+      lv_label_set_text(labels[6], "Ощ. --  Ветер --"); lv_label_set_text(labels[7], "Влажн. --  Давл. --");
     }
     if (homeIconObj) paintIcon(homeIconObj, city.valid ? weatherIconKind(city.icon) : WI_CLOUD, 30);
   } else if (activeScreen == WEATHER) {
@@ -1079,7 +1297,7 @@ void refreshScreen() {
     lv_label_set_text(labels[2], radio.title);
     char vol[64];
     if (radio.online) {
-      snprintf(vol, sizeof(vol), "На связи · %d/100 · %s", radio.volume, radio.playing ? "Играет" : "Стоп");
+      snprintf(vol, sizeof(vol), "На связи - %d/100 - %s", radio.volume, radio.playing ? "Играет" : "Стоп");
     } else {
       snprintf(vol, sizeof(vol), "Нет связи с yoRadio");
     }
@@ -1097,6 +1315,8 @@ void refreshScreen() {
         fillPlaylist();
       }
     }
+  } else if (activeScreen == RATES && rateGraphMode) {
+    refreshRateGraph();
   } else if (activeScreen == RATES) {
     lv_label_set_text(labels[0], appData.ratesMessage);
     const char *names[4] = {"USD/RUB", "EUR/RUB", "CNY/RUB", "GBP/RUB"};
@@ -1189,7 +1409,11 @@ void checkAlarmAndTimer() {
 }  // namespace
 
 void setup() {
+  // Drive BL off as early as firmware can; reset/bootloader behaviour is hardware-dependent.
+  digitalWrite(BACKLIGHT_PIN, LOW);
+  pinMode(BACKLIGHT_PIN, OUTPUT);
   Serial.begin(115200);
+  setupAlarmLed();
   pinMode(0, INPUT_PULLUP);
   preferences.begin("multi-cyd", false);
   alarmEnabled = preferences.getBool("alarmOn", DEFAULT_ALARM_ENABLED);
@@ -1200,8 +1424,8 @@ void setup() {
   spkOn = preferences.getBool("spk", ALARM_SPEAKER_ENABLED != 0);
 
   ledcSetup(BACKLIGHT_CHANNEL, 5000, 8);
+  ledcWrite(BACKLIGHT_CHANNEL, 0);
   ledcAttachPin(BACKLIGHT_PIN, BACKLIGHT_CHANNEL);
-  applyBrightness();
   ledcSetup(SPEAKER_CHANNEL, 1900, 8);
   ledcAttachPin(SPEAKER_PIN, SPEAKER_CHANNEL);
   ledcWriteTone(SPEAKER_CHANNEL, 0);
@@ -1212,9 +1436,15 @@ void setup() {
   touch.begin(touchBus);
   touch.setRotation(0);
   setupCalibration();
+  ledcWrite(BACKLIGHT_CHANNEL, 0);
 
   lv_init();
-  lv_disp_draw_buf_init(&drawBuffer, pixels, nullptr, SCREEN_WIDTH * 20);
+  pixels = static_cast<lv_color_t *>(malloc(sizeof(lv_color_t) * SCREEN_WIDTH * 16));
+  if (!pixels) {
+    Serial.println("Cannot allocate display buffer");
+    for (;;) delay(1000);
+  }
+  lv_disp_draw_buf_init(&drawBuffer, pixels, nullptr, SCREEN_WIDTH * 16);
   static lv_disp_drv_t displayDriver;
   lv_disp_drv_init(&displayDriver);
   displayDriver.hor_res = SCREEN_WIDTH;
@@ -1229,6 +1459,16 @@ void setup() {
   lv_indev_drv_register(&touchDriver);
   startNetworkServices();
   setupUi();
+  // Render the entire initial UI while the backlight is off.
+  lv_refr_now(nullptr);
+  if (millis() < 750) delay(750 - millis());
+  applyBrightness();
+  sdWeb.on("/", HTTP_GET, handleSdWeb);
+  sdWeb.onNotFound([](){ sdWeb.send(404, "text/plain", "Not found"); });
+  setupDlna();
+  setupSdAdmin();
+  setupWebOta();
+  sdWeb.begin();
 }
 
 void loop() {
@@ -1243,5 +1483,7 @@ void loop() {
     lastRefresh = now;
   }
   lv_timer_handler();
+  sdWeb.handleClient();
+  dlnaLoop();
   delay(5);
 }
