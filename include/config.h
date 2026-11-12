@@ -3,10 +3,10 @@
 // Configure these values before building. The web configurator generates this file.
 // IMPORTANT: in #define lines do NOT add ';' at the end and do NOT use spaces
 // inside numbers. Correct: 36000. Wrong: 36000; or 36 000.
-#define WIFI_SSID "17843C"
-#define WIFI_PASSWORD "01Suhomvit10"
+#define WIFI_SSID "ваш"
+#define WIFI_PASSWORD "ваш пароль"
 #define DEVICE_HOSTNAME "multiinformer-cyd"
-#define OWM_API_KEY "c0a36cc87aff8f6062834fcdfc346ef2"
+#define OWM_API_KEY "ваш ключ"
 #define CITY_A_NAME "Хабаровск"
 #define CITY_A_QUERY "Khabarovsk,ru"
 #define CITY_A_UTC_OFFSET 36000
